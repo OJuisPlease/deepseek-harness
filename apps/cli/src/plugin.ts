@@ -24,6 +24,7 @@ import {
   type ProfileManifest,
 } from '@deepseek-ai/dsh-app-boot'
 import { INSTALL_ANCHOR } from './profile-boot.ts'
+import { runPluginDoctor } from './plugin-doctor.ts'
 
 const NAME = 'dsh'
 
@@ -127,6 +128,13 @@ export function runPlugin(profile: string, args: readonly string[]): number {
       template?.patchReload,
     )
     process.stderr.write(`${NAME}: initialized profile ${profile} at ${dir}\n`)
+  }
+  if (args[0] === 'doctor') {
+    if (args.length !== 1) {
+      process.stderr.write(`${NAME}: plugin doctor takes no pnpm arguments\n`)
+      return 1
+    }
+    return runPluginDoctor(profile)
   }
   const before = readProfileManifest(NAME, dir)
   // Windows resolves pnpm through its .cmd shim, which spawn() refuses

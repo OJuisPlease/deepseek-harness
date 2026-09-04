@@ -12,9 +12,10 @@ import {
   loadOptionalPatches,
   loadOverlayPatches,
   renderConfigDump,
+  resolveProfileBundleLayers,
   type ConfigDumpLayer,
 } from '@deepseek-ai/dsh-app-boot'
-import { homePatchPath, prepareProfile, PROFILE_ROOT_FILENAME } from './profile-boot.ts'
+import { homePatchPath, INSTALL_ANCHOR, prepareProfile, PROFILE_ROOT_FILENAME } from './profile-boot.ts'
 
 const NAME = 'dsh'
 
@@ -29,7 +30,7 @@ const NAME = 'dsh'
  */
 export function runDumpConfig(profile: string, defaultOnly: boolean, patches: readonly string[]): void {
   const loaded = prepareProfile(profile, !defaultOnly)
-  const layers: ConfigDumpLayer[] = loaded.layers.map(layer => ({
+  const layers: ConfigDumpLayer[] = resolveProfileBundleLayers(NAME, loaded, INSTALL_ANCHOR).map(layer => ({
     label: layer.packageName,
     patches: layer.patches,
   }))

@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs'
 import { parseEnv } from 'node:util'
 import { basename, dirname, isAbsolute, resolve } from 'node:path'
 import * as yaml from 'js-yaml'
+import { dedupeActivationPatches } from './activation-resolver.ts'
 import { Context, type FiberState } from '@deepseek-ai/cordis'
 import Loader, { type Entry, type EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import Include, { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
@@ -39,6 +40,8 @@ export {
   PROFILES_DIR,
   readProfileManifest,
   resolveBundleDir,
+  resolveBundleLayer,
+  resolveProfileBundleLayers,
   resolveProfileDir,
   writeProfileManifest,
   type DshBundleManifest,
@@ -51,6 +54,7 @@ export {
   type ProfilePatchReload,
   type ProfileTemplate,
 } from './profile.ts'
+export { dedupeActivationPatches } from './activation-resolver.ts'
 
 /**
  * Resolve the config to boot. Replay swaps a `cordis.yml` basename for
@@ -442,8 +446,11 @@ export function renderConfigDump(
   // sharing patch objects across snapshot calls would leak a later
   // snapshot's mutations into an earlier one's result.
   const snapshot = (count: number, warnings: string[]): ReturnType<typeof applyEntryPatches> => {
-    const flattened = structuredClone(layers.slice(0, count).flatMap(layer => layer.patches))
-    return applyEntryPatches(base, flattened, (message: string, ...args: unknown[]) => {
+    // The resolver clones the flattened patches per snapshot, preserving the
+    // existing detachment contract while removing duplicate insert rows that
+    // the Loader would reject.
+    const flattened = layers.slice(0, count).flatMap(layer => layer.patches)
+    return applyEntryPatches(base, dedupeActivationPatches(flattened, base), (message: string, ...args: unknown[]) => {
       // The include logs through cordis's printf-style logger (`%C` = code); a
       // dump has no logger, so substitute inline for a plain line.
       let index = 0

@@ -35,6 +35,7 @@ import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { resolve as resolvePackage, type Package as ResolvePackageManifest } from 'resolve.exports'
+import { dedupeActivationPatches, sortActivationLayers } from './activation-resolver.ts'
 import { loadOverlayPatches } from './index.ts'
 
 /** Directory under the Harness home holding every profile. */
@@ -50,6 +51,12 @@ const PROFILE_MODULE_FALLBACK_DIR = '.dsh-module-fallback'
 export interface DshBundleManifest {
   /** The patch layer this bundle exports, relative to its package root. */
   patch: string
+  /**
+   * Bundle package names that must be activated before this bundle's own patch
+   * layer. This is an activation dependency only; package managers still own
+   * installation.
+   */
+  requires?: string[]
 }
 
 /** The profile half of the `dsh` manifest section: what a profile directory composes. */
@@ -100,6 +107,8 @@ export interface ProfileLayer {
   patchPath: string
   /** The parsed patch list. */
   patches: PatchOptions[]
+  /** Bundle packages whose activation layer must precede this layer. */
+  requires?: string[]
 }
 
 /** A loaded profile: resolved bundle layers plus the user's own patch layer. */
@@ -789,6 +798,35 @@ export function resolveBundleDir(
 }
 
 /**
+ * Resolve one bundle package to its patch layer. Shared by profile loading and
+ * activation-requires expansion so both read the same manifest fields.
+ * @param binName - the diagnostic prefix on thrown errors.
+ * @param packageName - the bundle package name.
+ * @param installAnchor - absolute path of the dsh app's package.json (first resolution anchor).
+ * @param profileDir - the profile directory (second resolution anchor).
+ * @returns the resolved bundle layer.
+ */
+export function resolveBundleLayer(
+  binName: string, packageName: string, installAnchor: string, profileDir: string,
+): ProfileLayer {
+  const packageDir = resolveBundleDir(binName, packageName, installAnchor, profileDir)
+  const bundleManifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as ProfileManifest
+  const declared = bundleManifest.dsh?.bundle?.patch
+  if (declared === undefined) {
+    throw new Error(`${binName}: profile bundle ${JSON.stringify(packageName)} declares no dsh.bundle in its package.json`)
+  }
+  const patchPath = join(packageDir, declared)
+  const requires = bundleManifest.dsh?.bundle?.requires
+  return {
+    packageName,
+    packageDir,
+    patchPath,
+    patches: loadOverlayPatches(binName, patchPath),
+    ...requires === undefined ? {} : { requires },
+  }
+}
+
+/**
  * Load a profile: resolve every `dsh.profile.bundles` entry to its patch
  * layer and parse the profile's own patch file. A listed bundle without a
  * `dsh.bundle` manifest fails loud — naming a bundle-less package as a layer
@@ -826,21 +864,52 @@ export function loadProfile(
     )
   }
   const patchReload = rawPatchReload ?? DEFAULT_PROFILE_PATCH_RELOAD
-  const layers = bundles.map((packageName): ProfileLayer => {
-    const packageDir = resolveBundleDir(binName, packageName, installAnchor, dir)
-    const bundleManifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as ProfileManifest
-    const declared = bundleManifest.dsh?.bundle?.patch
-    if (declared === undefined) {
-      throw new Error(`${binName}: profile bundle ${JSON.stringify(packageName)} declares no dsh.bundle in its package.json`)
-    }
-    const patchPath = join(packageDir, declared)
-    return { packageName, packageDir, patchPath, patches: loadOverlayPatches(binName, patchPath) }
-  })
+  const layers = bundles.map(packageName => resolveBundleLayer(binName, packageName, installAnchor, dir))
   const patchPath = join(dir, PROFILE_PATCH_FILENAME)
   const patches = options.userLayer !== false && existsSync(patchPath)
     ? loadOverlayPatches(binName, patchPath)
     : []
   return { name, dir, layers, patchPath, patches, patchReload }
+}
+
+/**
+ * Expand and order a profile's bundle layers for activation. Direct profile
+ * layers keep their declared order; a bundle's optional `dsh.bundle.requires`
+ * recursively pulls that bundle's patch layer ahead of the requiring layer.
+ * Duplicate packages are emitted once at their earliest required position.
+ * User and overlay layers are not part of this result; callers apply them
+ * above the returned bundle stack.
+ * @param binName - the diagnostic prefix on thrown errors.
+ * @param profile - the loaded profile whose direct layers to expand.
+ * @param installAnchor - absolute path of the dsh app's package.json (first resolution anchor).
+ * @returns resolved bundle layers in deterministic activation order.
+ * @throws when a required bundle cannot be resolved, is not a bundle, or a
+ * `requires` cycle exists.
+ */
+export function resolveProfileBundleLayers(
+  binName: string,
+  profile: Profile,
+  installAnchor: string,
+): ProfileLayer[] {
+  const direct = new Map(profile.layers.map(layer => [layer.packageName, layer]))
+  const loaded = new Map<string, ProfileLayer>()
+  const visiting: string[] = []
+
+  const visit = (packageName: string): void => {
+    if (loaded.has(packageName)) return
+    if (visiting.includes(packageName)) {
+      throw new Error(`${binName}: activation requires cycle: ${[...visiting, packageName].join(' -> ')}`)
+    }
+    visiting.push(packageName)
+    const layer = direct.get(packageName) ?? resolveBundleLayer(binName, packageName, installAnchor, profile.dir)
+    for (const required of layer.requires ?? []) visit(required)
+    visiting.pop()
+    loaded.set(packageName, layer)
+  }
+
+  for (const layer of profile.layers) visit(layer.packageName)
+  const sortable = [...loaded.values()].map(layer => ({ ...layer, id: layer.packageName }))
+  return sortActivationLayers(sortable)
 }
 
 /**
@@ -854,7 +923,7 @@ export function loadProfile(
 export function composeEntries(
   layers: readonly PatchOptions[][], warn: (message: string) => void = () => {},
 ): EntryOptions[] {
-  return applyEntryPatches([], structuredClone(layers.flat()), (message: string, ...args: unknown[]) => {
+  return applyEntryPatches([], dedupeActivationPatches(layers.flat()), (message: string, ...args: unknown[]) => {
     let index = 0
     warn(message.replace(/%C/g, () => JSON.stringify(args[index++])))
   })

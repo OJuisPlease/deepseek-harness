@@ -21,6 +21,8 @@ import {
   PROFILE_TEMPLATES,
   readProfileManifest,
   resolveBundleDir,
+  resolveBundleLayer,
+  resolveProfileBundleLayers,
   resolveProfileDir,
   writeProfileManifest,
   type Profile,
@@ -30,7 +32,7 @@ const tmp = (): string => mkdtempSync(join(tmpdir(), 'dsh-profile-'))
 
 /** Stage a fake installed app: package.json with deps and a node_modules holding bundles. */
 function stageInstallation(
-  bundles: Record<string, { patch?: string; deps?: Record<string, string> }>,
+  bundles: Record<string, { patch?: string; deps?: Record<string, string>; requires?: string[] }>,
   appName = 'dsh-app',
 ): string {
   const root = tmp()
@@ -47,7 +49,14 @@ function stageInstallation(
       type: 'module',
       main: './index.js',
       dependencies: spec.deps ?? {},
-      ...spec.patch === undefined ? {} : { dsh: { bundle: { patch: './cordis.patch.yml' } } },
+      ...spec.patch === undefined ? {} : {
+        dsh: {
+          bundle: {
+            patch: './cordis.patch.yml',
+            ...spec.requires === undefined ? {} : { requires: spec.requires },
+          },
+        },
+      },
     }))
     writeFileSync(join(dir, 'index.js'), `export const packageName = ${JSON.stringify(name)}\n`)
     if (spec.patch !== undefined) writeFileSync(join(dir, 'cordis.patch.yml'), spec.patch)
@@ -285,6 +294,61 @@ describe('loadProfile', () => {
     const dir = resolveProfileDir('demo', home)
     initProfile(dir, ['not-a-bundle'])
     expect(() => loadProfile('t', 'demo', anchor, home)).toThrow('declares no dsh.bundle')
+  })
+})
+
+describe('resolveProfileBundleLayers', () => {
+  it('expands a required bundle ahead of the requiring bundle', () => {
+    const anchor = stageInstallation({
+      'bundle-a': { patch: '- insert:\n    - id: a\n      name: pkg-a\n', requires: ['bundle-b'] },
+      'bundle-b': { patch: '- insert:\n    - id: b\n      name: pkg-b\n' },
+    })
+    const home = tmp()
+    const dir = resolveProfileDir('demo', home)
+    initProfile(dir, ['bundle-a'])
+    const profile = loadProfile('t', 'demo', anchor, home)
+    const layers = resolveProfileBundleLayers('t', profile, anchor)
+    expect(layers.map(layer => layer.packageName)).toEqual(['bundle-b', 'bundle-a'])
+  })
+
+  it('emits a later direct dependency only once at its required position', () => {
+    const anchor = stageInstallation({
+      'bundle-a': { patch: '- insert:\n    - id: a\n      name: pkg-a\n', requires: ['bundle-b'] },
+      'bundle-b': { patch: '- insert:\n    - id: b\n      name: pkg-b\n' },
+    })
+    const home = tmp()
+    const dir = resolveProfileDir('demo', home)
+    initProfile(dir, ['bundle-a', 'bundle-b'])
+    const profile = loadProfile('t', 'demo', anchor, home)
+    const layers = resolveProfileBundleLayers('t', profile, anchor)
+    expect(layers.map(layer => layer.packageName)).toEqual(['bundle-b', 'bundle-a'])
+  })
+
+  it('fails loud on a requires cycle', () => {
+    const anchor = stageInstallation({
+      'bundle-a': { patch: '- insert: []\n', requires: ['bundle-b'] },
+      'bundle-b': { patch: '- insert: []\n', requires: ['bundle-a'] },
+    })
+    const home = tmp()
+    const dir = resolveProfileDir('demo', home)
+    initProfile(dir, ['bundle-a'])
+    const profile = loadProfile('t', 'demo', anchor, home)
+    expect(() => resolveProfileBundleLayers('t', profile, anchor))
+      .toThrow(/activation requires cycle: bundle-a -> bundle-b -> bundle-a/)
+  })
+
+  it('resolves a required bundle through resolveBundleLayer', () => {
+    const anchor = stageInstallation({
+      'bundle-a': { patch: '- insert: []\n', requires: ['bundle-b'] },
+      'bundle-b': { patch: '- insert: []\n' },
+    })
+    const home = tmp()
+    const dir = resolveProfileDir('demo', home)
+    initProfile(dir, ['bundle-a'])
+    const profile = loadProfile('t', 'demo', anchor, home)
+    const resolved = resolveProfileBundleLayers('t', profile, anchor)
+    expect(resolved[0]?.packageName).toBe('bundle-b')
+    expect(resolveBundleLayer('t', 'bundle-b', anchor, dir).packageName).toBe('bundle-b')
   })
 })
 
